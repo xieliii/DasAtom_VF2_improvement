@@ -53,6 +53,117 @@ def get_rx_one_mapping(graph_max, G):
     reverse_mapping = {rx_nx_s[value]: rx_nx_G[key] for  key, value in item.items()}
     return reverse_mapping
 
+
+def get_best_mapping_with_inertia(graph_max, G, num_q, 
+                                  prev_embedding=None,
+                                  current_gates=None,
+                                  max_candidates=50,
+                                  idle_weight=0.3):
+    """
+    基于惯性启发式的改进 VF2 映射选择器
+    
+    通过评估多个 VF2 解，选择使原子移动距离最小的映射。
+    采用加权策略：参与门操作的量子比特权重为 1.0，闲置量子比特权重为 idle_weight。
+    
+    参数:
+        graph_max: 逻辑连接图（NetworkX Graph）
+        G: 硬件拓扑图（NetworkX Graph）
+        num_q: 量子比特总数
+        prev_embedding: 上一个分区的嵌入映射（列表格式）
+        current_gates: 当前分区的门列表 [[q0,q1], ...]
+        max_candidates: 最多评估的 VF2 候选解数量
+        idle_weight: 闲置量子比特的移动成本权重 (0.0-1.0)
+                    0.0 = 只考虑参与门的量子比特（激进）
+                    1.0 = 所有量子比特同等重要（保守）
+                    0.3 = 推荐值（平衡）
+    
+    返回:
+        reverse_mapping: 字典格式的映射 {logical_qubit: physical_position}
+    """
+    # 1. 图结构转换 (NetworkX -> RustworkX)
+    sub_graph = rx.networkx_converter(graph_max)
+    big_graph = rx.networkx_converter(G)
+    
+    # 2. 建立 RustworkX ID 与 NetworkX 节点的映射表
+    nx_edge_s = list(graph_max.edges())
+    rx_edge_s = list(sub_graph.edge_list())
+    rx_nx_s = dict()
+    for i in range(len(rx_edge_s)):
+        if rx_edge_s[i][0] not in rx_nx_s:
+            rx_nx_s[rx_edge_s[i][0]] = nx_edge_s[i][0]
+        if rx_edge_s[i][1] not in rx_nx_s:
+            rx_nx_s[rx_edge_s[i][1]] = nx_edge_s[i][1]
+    
+    nx_edge_G = list(G.edges())
+    rx_edge_G = list(big_graph.edge_list())
+    rx_nx_G = dict()
+    for i in range(len(rx_edge_G)):
+        if rx_edge_G[i][0] not in rx_nx_G:
+            rx_nx_G[rx_edge_G[i][0]] = nx_edge_G[i][0]
+        if rx_edge_G[i][1] not in rx_nx_G:
+            rx_nx_G[rx_edge_G[i][1]] = nx_edge_G[i][1]
+    
+    # 3. 获取 VF2 迭代器
+    vf2_iter = rx.vf2_mapping(big_graph, sub_graph, subgraph=True, induced=False)
+    
+    # 4. 如果没有前一个映射或门信息，使用原版逻辑
+    if prev_embedding is None or current_gates is None:
+        try:
+            item = next(vf2_iter)
+            reverse_mapping = {rx_nx_s[value]: rx_nx_G[key] 
+                             for key, value in item.items()}
+            return reverse_mapping
+        except StopIteration:
+            return None
+    
+    # 5. 识别参与当前分区门操作的量子比特（活跃量子比特）
+    active_qubits = set()
+    for gate in current_gates:
+        active_qubits.add(gate[0])
+        active_qubits.add(gate[1])
+    
+    # 6. 遍历多个 VF2 解，选择移动成本最小的
+    best_mapping = None
+    min_move_cost = float('inf')
+    
+    for candidate_idx, item in enumerate(vf2_iter):
+        if candidate_idx >= max_candidates:
+            break
+        
+        # 转换当前候选解为 NetworkX 格式
+        candidate_mapping = {rx_nx_s[value]: rx_nx_G[key] 
+                           for key, value in item.items()}
+        
+        # 计算加权移动成本
+        move_cost = 0.0
+        
+        for logical_q, curr_pos in candidate_mapping.items():
+            # 只有当该量子比特在上一个映射中存在时才计算
+            if logical_q < len(prev_embedding) and prev_embedding[logical_q] != -1:
+                prev_pos = prev_embedding[logical_q]
+                
+                # 欧几里得距离
+                dist = math.sqrt(
+                    (curr_pos[0] - prev_pos[0])**2 + 
+                    (curr_pos[1] - prev_pos[1])**2
+                )
+                
+                # 加权策略：活跃量子比特权重1.0，闲置量子比特权重为idle_weight
+                weight = 1.0 if logical_q in active_qubits else idle_weight
+                move_cost += weight * dist
+        
+        # 更新最优解
+        if move_cost < min_move_cost:
+            min_move_cost = move_cost
+            best_mapping = candidate_mapping
+        
+        # 完美解：零移动（使用浮点数比较）
+        if min_move_cost < 1e-6:
+            break
+    
+    # 如果找到优化解则返回，否则返回最后一个候选
+    return best_mapping if best_mapping is not None else candidate_mapping
+
 def rx_is_subgraph_iso(G, subG):
     Grx = rx.networkx_converter(G)
     subGrx = rx.networkx_converter(subG)
@@ -364,43 +475,90 @@ def compute_fidelity(parallel_gates, all_movements, num_q, gate_num, para=None):
     num_trans = 0
     num_move = 0
     all_move_dis = 0
-    for move in all_movements:
-        t_total += (4 * para['T_trans']) # pick/drop/pick/drop
-        t_move += (4 * para['T_trans'])
-        num_trans += 4
-        max_dis = 0
-        for each_move in move:
-            num_move += 1
-            x1, y1 = each_move[1][0],each_move[1][1]
-            x2, y2 = each_move[2][0],each_move[2][1]
-            dis = (abs(x2-x1)*para['AOD_width'])**2 + (abs(y2-y1)*para['AOD_height'])**2
-            if dis > max_dis:
-                max_dis = dis
-        max_dis = math.sqrt(max_dis)
-        all_move_dis += max_dis
-        t_total += (max_dis/para['Move_speed'])
-        t_move += (max_dis/para['Move_speed'])
+    for move_stage in all_movements:
+        # 每个 move_stage 是一个移动阶段，包含多个移动步骤
+        for move_step in move_stage:
+            # 每个 move_step 是一个步骤，包含可以并行执行的移动
+            t_total += (4 * para['T_trans']) # pick/drop/pick/drop
+            t_move += (4 * para['T_trans'])
+            num_trans += 4
+            max_dis = 0
+            for each_move in move_step:
+                # 每个 each_move 是 [qubit_id, (x1,y1), (x2,y2)]
+                num_move += 1
+                x1, y1 = each_move[1][0], each_move[1][1]
+                x2, y2 = each_move[2][0], each_move[2][1]
+                dis = (abs(x2-x1)*para['AOD_width'])**2 + (abs(y2-y1)*para['AOD_height'])**2
+                if dis > max_dis:
+                    max_dis = dis
+            max_dis = math.sqrt(max_dis)
+            all_move_dis += max_dis
+            t_total += (max_dis/para['Move_speed'])
+            t_move += (max_dis/para['Move_speed'])
 
     t_idle = num_q * t_total - gate_num * para['T_cz']
     Fidelity = math.exp(-t_idle/para['T_eff']) * (para['F_cz']**gate_num) * (para['F_trans'] ** num_trans)
     move_fidelity = math.exp(-t_move/para['T_eff'])
     return t_idle, Fidelity, move_fidelity, t_total, num_trans, num_move, all_move_dis
 
-def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initial_mapping=None):
+def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, 
+                  initial_mapping=None, optimize_movement=True, 
+                  max_candidates=50, idle_weight=0.3):
+    """
+    获取每个分区的嵌入映射
+    
+    参数:
+        partition_gates: 分区门列表
+        coupling_graph: 硬件拓扑图
+        num_q: 量子比特数
+        arch_size: 网格大小
+        Rb: 交互半径
+        initial_mapping: 初始映射（可选）
+        optimize_movement: 是否启用移动优化（默认True）
+        max_candidates: VF2 候选解数量（默认50）
+        idle_weight: 闲置量子比特权重（默认0.3）
+    
+    返回:
+        embeddings: 嵌入列表
+        extend_position: 扩展位置列表
+    """
     embeddings = []
     begin_index = 0
     extend_position = []
     if initial_mapping:
         embeddings.append(initial_mapping)
         begin_index = 1
+    
     for i in range(begin_index, len(partition_gates)):
         tmp_graph = nx.Graph()
         tmp_graph.add_edges_from(partition_gates[i])
         if not rx_is_subgraph_iso(coupling_graph, tmp_graph):
             coupling_graph = extend_graph(coupling_graph, arch_size, Rb)
             extend_position.append(i)
-        next_embedding = get_rx_one_mapping(tmp_graph, coupling_graph)
-        next_embedding = map2list(next_embedding,num_q)
+        
+        # === 核心优化逻辑 ===
+        # 只有当开启优化、不是第一个分区、且有多于1个分区时才优化
+        next_embedding = None
+        if optimize_movement and i > 0 and len(partition_gates) > 1:
+            try:
+                next_embedding = get_best_mapping_with_inertia(
+                    tmp_graph, 
+                    coupling_graph, 
+                    num_q,
+                    prev_embedding=embeddings[i-1],
+                    current_gates=partition_gates[i],
+                    max_candidates=max_candidates,
+                    idle_weight=idle_weight
+                )
+            except Exception as e:
+                print(f"⚠️  优化失败于分区 {i}: {e}，回退到原版算法")
+                next_embedding = None
+        
+        # 如果优化失败或未启用，使用原版逻辑
+        if next_embedding is None:
+            next_embedding = get_rx_one_mapping(tmp_graph, coupling_graph)
+        
+        next_embedding = map2list(next_embedding, num_q)
         embeddings.append(next_embedding)
 
     for i in range(begin_index, len(embeddings)):
