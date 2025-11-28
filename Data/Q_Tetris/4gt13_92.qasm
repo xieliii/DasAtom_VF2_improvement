@@ -1,16 +1,16 @@
 OPENQASM 2.0;
 include "qelib1.inc";
-qreg q[16];
+qreg q[16]; //声明16个量子比特寄存器（但实际只用了q[0]-q[4]）
 creg c[16];
-cx q[4],q[0];
-h q[0];
-t q[1];
+cx q[4],q[0]; //(CNOT/CX门): 30 个
+h q[0]; //(Hadamard门): 8 个
+t q[1]; //t (T门): 14 个
 t q[4];
 t q[0];
 cx q[4],q[1];
 cx q[0],q[4];
 cx q[1],q[0];
-tdg q[4];
+tdg q[4]; //tdg (T†门): 8 个
 cx q[1],q[4];
 tdg q[1];
 tdg q[4];
